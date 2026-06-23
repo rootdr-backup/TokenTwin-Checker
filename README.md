@@ -1,3 +1,19 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rootdr-backup/TokenTwin-Checker/main/banner.png" alt="TokenTwin Checker Banner">
+</p>
+
+<h1 align="center">TokenTwin Checker</h1>
+
+<p align="center">
+  Automated Multi-User BAC & IDOR Testing for Burp Suite
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Burp%20Suite-Extension-orange">
+  <img src="https://img.shields.io/badge/Java-17+-blue">
+  <img src="https://img.shields.io/badge/License-MIT-green">
+</p>
+
 TokenTwin Checker
 
 Multi-User Broken Access Control (BAC) & IDOR Testing Extension for Burp
