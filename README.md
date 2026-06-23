@@ -1,10 +1,4 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/rootdr-backup/TokenTwin-Checker/main/banner.png" alt="TokenTwin Checker Banner">
-</p>
-
-<h1 align="center">TokenTwin Checker</h1>
-
-<p align="center">
   Automated Multi-User BAC & IDOR Testing for Burp Suite
 </p>
 
@@ -15,6 +9,12 @@
 </p>
 
 TokenTwin Checker
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rootdr-backup/TokenTwin-Checker/main/banner.png" alt="TokenTwin Checker Banner">
+</p>
+
+<h1 align="center">TokenTwin Checker</h1>
 
 Multi-User Broken Access Control (BAC) & IDOR Testing Extension for Burp
 Suite
