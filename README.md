@@ -83,6 +83,3 @@ Disclaimer
 
 Use only against systems you are authorized to test.
 
-License
-
-MIT License
