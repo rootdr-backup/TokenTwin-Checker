@@ -7,9 +7,6 @@
   <img src="https://img.shields.io/badge/Java-17+-blue">
   <img src="https://img.shields.io/badge/License-MIT-green">
 </p>
-
-TokenTwin Checker
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/rootdr-backup/TokenTwin-Checker/main/banner.png" alt="TokenTwin Checker Banner">
 </p>
