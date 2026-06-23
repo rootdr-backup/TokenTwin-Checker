@@ -1217,6 +1217,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                 self._model.setRowCount(0)
                 self._msg_store.clear()
                 self._poc_panel.clear()
+                self._last_profile_labels = None
                 self._log("[*] Results cleared.")
         class _Exp(ActionListener):
             def actionPerformed(_s, e): self._export_csv()
@@ -1502,16 +1503,30 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                     "Baseline Not Set", JOptionPane.WARNING_MESSAGE)
                 profiles[0].is_baseline = True
 
-        # Rebuild columns
-        self._rebuild_model(profiles)
-        self._msg_store.clear()
-        self._poc_panel.clear()
+        # Prevent overlapping runs — wait for previous thread to finish
+        active = getattr(self, "_active_thread", None)
+        if active is not None and active.is_alive():
+            JOptionPane.showMessageDialog(
+                self._root,
+                "A test is still running.\nWait for it to finish or Clear results first.",
+                "Busy", JOptionPane.WARNING_MESSAGE)
+            return
 
+        # Rebuild columns only if user structure changed (label set differs)
+        new_labels = [p.label for p in profiles]
+        cur_labels = getattr(self, "_last_profile_labels", None)
+        if cur_labels != new_labels:
+            self._rebuild_model(profiles)
+            self._last_profile_labels = new_labels
+
+        # Do NOT clear msg_store or results — append new results to existing list
         # Store messages for possible re-run
         self._last_messages = messages
 
+        ext_self = self
+
         def _after_done():
-            self._apply_filter(self._active_filter)
+            ext_self._apply_filter(ext_self._active_filter)
 
         t = AnalysisThread(
             ext             = self,
@@ -1526,6 +1541,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             log_fn          = self._log,
             on_done_fn      = _after_done,
         )
+        self._active_thread = t
         self._pb.setValue(0)
         self._pb.setString("Starting…")
         t.start()
