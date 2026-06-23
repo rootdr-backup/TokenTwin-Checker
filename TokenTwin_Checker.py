@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-TokenTwin Checker v3.0  -  Dual Token BAC / IDOR Tester
+TokenTwin Checker v4.0  -  Multi-User BAC / IDOR Tester
 Burp Suite Extension  |  Jython 2.7 compatible
 
-New in v3:
-  - Smart Filter: skips static assets, only tests IDOR-relevant endpoints
-  - IDOR Pattern Detector: scores each URL, adds Risk column with matched pattern
-  - Diff Viewer: click any row to see side-by-side body comparison
-  - Filter bar: show only SAME / High-Risk results
-  - Body storage: responses kept in memory for diff without re-requesting
+New in v4:
+  - Multi-User: Add/remove unlimited users, each with their own token
+  - Header Manager: Replace the old Type/Name combo with a full per-user
+    header table (Key: Value rows). Cookies are just headers — add a
+    "Cookie" row with "session=abc; other=xyz" value.
+  - Multiple headers per user (e.g. Authorization + X-User-ID + Cookie)
+  - Baseline User: designate one user as the "owner/attacker" baseline;
+    all other users are tested against it
+  - Comparison Mode: "All vs Baseline" or "All vs All"
+  - Dynamic result columns: columns scale with user count
+  - Per-user color coding in POC viewer
+  - Profile Import/Export: save/load user sets as JSON
+  - Smart Filter, IDOR Pattern Detector, Diff Viewer — all preserved
 
 Install:
   Extender > Options > Python Environment > jython-standalone-*.jar
@@ -24,17 +31,20 @@ from javax.swing import (
     JTable, JScrollPane, JComboBox, JSplitPane,
     JProgressBar, JFileChooser, JTextArea, JMenuItem,
     BorderFactory, SwingUtilities, JOptionPane, BoxLayout,
-    JToggleButton, ButtonGroup
+    JToggleButton, ButtonGroup, JTabbedPane, JToolBar,
+    ScrollPaneConstants, DefaultListModel, JList,
+    ListSelectionModel
 )
 from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
 from javax.swing.border import EmptyBorder
 from javax.swing.event import ListSelectionListener
 from java.awt import (
     BorderLayout, GridBagLayout, GridBagConstraints, Insets,
-    Color, Font, Dimension, FlowLayout, Cursor, GridLayout
+    Color, Font, Dimension, FlowLayout, Cursor, GridLayout,
+    CardLayout
 )
-from java.awt.event import ActionListener
-from java.io import PrintWriter, FileWriter
+from java.awt.event import ActionListener, FocusAdapter
+from java.io import PrintWriter, FileWriter, FileReader, BufferedReader
 from java.util import ArrayList
 
 # ── stdlib ────────────────────────────────────────────────────
@@ -44,6 +54,8 @@ import traceback
 import threading
 import difflib
 import jarray
+import json
+import os
 
 
 # ─────────────────────────────────────────────────────────────
@@ -65,68 +77,98 @@ class P:
     BTN_SAVE  = Color(0x89, 0xDC, 0xEB)
     BTN_CLR   = Color(0xF3, 0x8B, 0xA8)
     BTN_EXP   = Color(0xA6, 0xE3, 0xA1)
-    DIFF_ADD  = Color(0x1E, 0x3A, 0x1E)   # dark green bg for diff added
-    DIFF_DEL  = Color(0x3A, 0x1E, 0x1E)   # dark red bg for diff removed
+    BTN_ADD   = Color(0xA6, 0xE3, 0xA1)
+    BTN_DEL   = Color(0xF3, 0x8B, 0xA8)
+    BTN_IMP   = Color(0xF9, 0xE2, 0xAF)
+    DIFF_ADD  = Color(0x1E, 0x3A, 0x1E)
+    DIFF_DEL  = Color(0x3A, 0x1E, 0x1E)
+
+    # Per-user accent colors (cycles if > len)
+    USER_COLORS = [
+        Color(0x74, 0xC7, 0xEC),   # blue
+        Color(0xCB, 0xA6, 0xF7),   # purple
+        Color(0xA6, 0xE3, 0xA1),   # green
+        Color(0xFA, 0xB3, 0x87),   # orange
+        Color(0xF9, 0xE2, 0xAF),   # yellow
+        Color(0xF3, 0x8B, 0xA8),   # red
+        Color(0x89, 0xDC, 0xEB),   # cyan
+        Color(0xB4, 0xBE, 0xFE),   # lavender
+    ]
+
+    @staticmethod
+    def user_color(idx):
+        return P.USER_COLORS[idx % len(P.USER_COLORS)]
 
 
 # ─────────────────────────────────────────────────────────────
 #  Smart Filter
 # ─────────────────────────────────────────────────────────────
-# Extensions that are never interesting for BAC/IDOR
 _STATIC_EXT = re.compile(
     r'\.(js|css|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|map|pdf|zip)(\?.*)?$',
     re.IGNORECASE
 )
 
-# URL patterns that suggest a specific resource ID is present
 _IDOR_PATTERNS = [
-    # numeric ID in path segment  e.g. /users/1234  /orders/3720719
     (r'/\d{2,}(?:/|$|\?)',          "Numeric ID in path",      "HIGH"),
-    # UUID in path
     (r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/|$|\?)',
                                      "UUID in path",            "HIGH"),
-    # common IDOR param names in query string
     (r'[?&](id|uid|user_id|account|account_id|order_id|ticket_id|invoice_id'
      r'|customer_id|file_id|doc_id|record_id|item_id|resource_id)=',
                                      "IDOR param in query",     "HIGH"),
-    # numeric value in any query param  e.g. ?ref=9988
     (r'[?&][a-z_]+=\d{2,}',         "Numeric param value",     "MEDIUM"),
-    # /me /self /account  (BAC without ID)
     (r'/(me|self|account|profile|dashboard|settings|preferences)(?:/|$|\?)',
                                      "Self-reference endpoint", "MEDIUM"),
-    # /admin  /internal
     (r'/(admin|internal|manage|staff|superuser)(?:/|$|\?)',
                                      "Admin endpoint",          "HIGH"),
 ]
-# Precompile
 _IDOR_PATTERNS = [(re.compile(p, re.IGNORECASE), label, risk)
                    for p, label, risk in _IDOR_PATTERNS]
 
-# Methods always worth testing (even without an ID pattern)
 _INTERESTING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 def smart_filter(method, url):
-    """
-    Returns (should_test, risk_level, pattern_label).
-    risk_level: "HIGH" | "MEDIUM" | "LOW" | "SKIP"
-    """
-    # Always skip static assets
     path = url.split("?")[0]
     if _STATIC_EXT.search(path):
         return False, "SKIP", "Static asset"
-
-    # Check IDOR patterns
     for pattern, label, risk in _IDOR_PATTERNS:
         if pattern.search(url):
             return True, risk, label
-
-    # POST/PUT/PATCH/DELETE are always interesting even without an ID
     if method.upper() in _INTERESTING_METHODS:
         return True, "LOW", "Mutable method ({})".format(method.upper())
-
-    # Plain GET with no ID pattern – low priority but still testable
     return True, "LOW", "Generic endpoint"
+
+
+# ─────────────────────────────────────────────────────────────
+#  User Profile model
+# ─────────────────────────────────────────────────────────────
+class UserProfile(object):
+    """Represents one test user: a label + ordered list of (key, value) headers."""
+
+    def __init__(self, label="User", headers=None, is_baseline=False):
+        self.label       = label
+        # headers: list of [key, value] pairs
+        self.headers     = headers if headers is not None else [["Authorization", ""]]
+        self.is_baseline = is_baseline
+
+    def to_dict(self):
+        return {
+            "label":       self.label,
+            "headers":     self.headers,
+            "is_baseline": self.is_baseline,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        return UserProfile(
+            label       = d.get("label", "User"),
+            headers     = d.get("headers", [["Authorization", ""]]),
+            is_baseline = d.get("is_baseline", False),
+        )
+
+    def clone(self):
+        import copy
+        return UserProfile(self.label, copy.deepcopy(self.headers), self.is_baseline)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -139,8 +181,9 @@ def lbl(text, bold=False, size=12, color=None):
     return w
 
 
-def fld(cols=30):
+def fld(cols=30, text=""):
     w = JTextField(cols)
+    w.setText(text)
     w.setBackground(P.BG_FIELD)
     w.setForeground(P.TEXT)
     w.setCaretColor(P.ACCENT)
@@ -152,11 +195,11 @@ def fld(cols=30):
     return w
 
 
-def mk_btn(text, bg):
+def mk_btn(text, bg, fg=None):
     w = JButton(text)
     w.setBackground(bg)
-    w.setForeground(Color(0x1E, 0x1E, 0x2E))
-    w.setFont(Font("Segoe UI", Font.BOLD, 12))
+    w.setForeground(fg or Color(0x1E, 0x1E, 0x2E))
+    w.setFont(Font("Segoe UI", Font.BOLD, 11))
     w.setFocusPainted(False)
     w.setBorderPainted(False)
     w.setOpaque(True)
@@ -181,30 +224,410 @@ def mk_cb(text):
     return w
 
 
+def mk_sep():
+    """Vertical separator panel."""
+    p = JPanel()
+    p.setBackground(P.BORDER)
+    p.setPreferredSize(Dimension(1, 20))
+    return p
+
+
 # ─────────────────────────────────────────────────────────────
-#  Table columns
-#  0:#  1:Method  2:URL  3:Risk  4:Pattern  5:S1  6:L1  7:S2  8:L2  9:Result
+#  Header table model
+#  Two columns: "Header Name" | "Value"
 # ─────────────────────────────────────────────────────────────
-COLS = ["#", "Method", "URL", "Risk", "Pattern",
-        "St.T1", "Len T1", "St.T2", "Len T2", "Result"]
+class HeaderTableModel(DefaultTableModel):
+    HDR_COLS = ["Header Name", "Value"]
+
+    def __init__(self, rows=None):
+        DefaultTableModel.__init__(self, self.HDR_COLS, 0)
+        if rows:
+            for r in rows:
+                self.addRow(r)
+
+    def isCellEditable(self, r, c):
+        return True   # allow inline editing
+
+    def get_pairs(self):
+        """Return list of [name, value] from current rows (skip blank names)."""
+        pairs = []
+        for r in range(self.getRowCount()):
+            name  = str(self.getValueAt(r, 0) or "").strip()
+            value = str(self.getValueAt(r, 1) or "").strip()
+            if name:
+                pairs.append([name, value])
+        return pairs
+
+    def load_pairs(self, pairs):
+        self.setRowCount(0)
+        for p in pairs:
+            self.addRow(p)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Per-user header editor panel
+# ─────────────────────────────────────────────────────────────
+class UserHeaderPanel(JPanel):
+    """
+    A compact panel showing:
+      - Label field
+      - Header table (Name | Value) with Add/Remove row buttons
+      - [Baseline] toggle
+    """
+
+    def __init__(self, profile, color, on_baseline_cb=None):
+        JPanel.__init__(self, BorderLayout(0, 4))
+        self.setBackground(P.BG_PANEL)
+        self.setBorder(BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(color, 2),
+            EmptyBorder(6, 8, 6, 8)
+        ))
+        self._color           = color
+        self._profile         = profile
+        self._on_baseline_cb  = on_baseline_cb
+
+        # ── Top bar: label + baseline badge ──────────────────
+        top = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        top.setBackground(P.BG_PANEL)
+        top.add(lbl("Label:", bold=True, size=11, color=color))
+        self._label_fld = fld(12, profile.label)
+        self._label_fld.setFont(Font("Segoe UI", Font.BOLD, 11))
+        top.add(self._label_fld)
+
+        self._baseline_btn = JToggleButton("Baseline")
+        self._baseline_btn.setSelected(profile.is_baseline)
+        self._baseline_btn.setFont(Font("Segoe UI", Font.BOLD, 10))
+        self._baseline_btn.setBackground(P.ACCENT if profile.is_baseline else P.BG_FIELD)
+        self._baseline_btn.setForeground(Color(0x1E, 0x1E, 0x2E) if profile.is_baseline else P.DIM)
+        self._baseline_btn.setFocusPainted(False)
+        self._baseline_btn.setBorderPainted(True)
+        self._baseline_btn.setOpaque(True)
+        self._baseline_btn.setToolTipText(
+            "Mark this user as the Baseline (owner). Others are tested against it.")
+
+        ext = self
+        class _BL(ActionListener):
+            def actionPerformed(_s, e):
+                if ext._on_baseline_cb:
+                    ext._on_baseline_cb(ext)
+        self._baseline_btn.addActionListener(_BL())
+        top.add(self._baseline_btn)
+        self.add(top, BorderLayout.NORTH)
+
+        # ── Header table ─────────────────────────────────────
+        self._hdr_model = HeaderTableModel(list(profile.headers))
+        self._hdr_table = JTable(self._hdr_model)
+        self._hdr_table.setBackground(P.BG_FIELD)
+        self._hdr_table.setForeground(P.TEXT)
+        self._hdr_table.setGridColor(P.BORDER)
+        self._hdr_table.setRowHeight(22)
+        self._hdr_table.setFont(Font("Consolas", Font.PLAIN, 11))
+        self._hdr_table.setSelectionBackground(P.BORDER)
+        self._hdr_table.getTableHeader().setBackground(P.BG_DARK)
+        self._hdr_table.getTableHeader().setForeground(color)
+        self._hdr_table.getTableHeader().setFont(Font("Segoe UI", Font.BOLD, 10))
+        self._hdr_table.getColumnModel().getColumn(0).setPreferredWidth(140)
+        self._hdr_table.getColumnModel().getColumn(1).setPreferredWidth(280)
+
+        sc = JScrollPane(self._hdr_table)
+        sc.setPreferredSize(Dimension(0, 90))
+        sc.getViewport().setBackground(P.BG_FIELD)
+        sc.setBorder(BorderFactory.createLineBorder(P.BORDER, 1))
+        self.add(sc, BorderLayout.CENTER)
+
+        # ── Row buttons ──────────────────────────────────────
+        btn_row = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        btn_row.setBackground(P.BG_PANEL)
+
+        b_add_hdr  = mk_btn("+ Header", P.BTN_ADD)
+        b_add_ck   = mk_btn("+ Cookie", P.BTN_IMP)
+        b_del_row  = mk_btn("- Remove", P.BTN_DEL)
+        b_add_hdr.setToolTipText("Add a new header row")
+        b_add_ck.setToolTipText("Add a Cookie header row")
+        b_del_row.setToolTipText("Remove the selected row")
+
+        class _AddHdr(ActionListener):
+            def actionPerformed(_s, e):
+                ext._hdr_model.addRow(["", ""])
+                r = ext._hdr_model.getRowCount() - 1
+                ext._hdr_table.setRowSelectionInterval(r, r)
+                ext._hdr_table.editCellAt(r, 0)
+
+        class _AddCk(ActionListener):
+            def actionPerformed(_s, e):
+                ext._hdr_model.addRow(["Cookie", ""])
+                r = ext._hdr_model.getRowCount() - 1
+                ext._hdr_table.setRowSelectionInterval(r, r)
+                ext._hdr_table.editCellAt(r, 1)
+
+        class _Del(ActionListener):
+            def actionPerformed(_s, e):
+                sel = ext._hdr_table.getSelectedRow()
+                if sel >= 0 and ext._hdr_model.getRowCount() > 1:
+                    ext._hdr_model.removeRow(sel)
+
+        b_add_hdr.addActionListener(_AddHdr())
+        b_add_ck.addActionListener(_AddCk())
+        b_del_row.addActionListener(_Del())
+
+        btn_row.add(b_add_hdr)
+        btn_row.add(b_add_ck)
+        btn_row.add(b_del_row)
+        self.add(btn_row, BorderLayout.SOUTH)
+
+    def set_baseline(self, is_bl):
+        self._baseline_btn.setSelected(is_bl)
+        self._baseline_btn.setBackground(P.ACCENT if is_bl else P.BG_FIELD)
+        self._baseline_btn.setForeground(
+            Color(0x1E, 0x1E, 0x2E) if is_bl else P.DIM)
+
+    def get_profile(self):
+        """Return a UserProfile reflecting current UI state."""
+        # Stop any active cell editing first
+        if self._hdr_table.isEditing():
+            self._hdr_table.getCellEditor().stopCellEditing()
+        p = UserProfile(
+            label       = self._label_fld.getText().strip() or "User",
+            headers     = self._hdr_model.get_pairs(),
+            is_baseline = self._baseline_btn.isSelected(),
+        )
+        return p
+
+
+# ─────────────────────────────────────────────────────────────
+#  Multi-user configuration panel
+# ─────────────────────────────────────────────────────────────
+class UserManagerPanel(JPanel):
+    """
+    Scrollable list of UserHeaderPanel widgets.
+    Buttons: Add User | Remove Last | Import | Export
+    """
+    MAX_USERS = 12
+
+    def __init__(self):
+        JPanel.__init__(self, BorderLayout(0, 0))
+        self.setBackground(P.BG_DARK)
+
+        self._user_panels = []   # list of UserHeaderPanel
+
+        # ── Toolbar ───────────────────────────────────────────
+        tb = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4))
+        tb.setBackground(P.BG_DARK)
+        tb.add(lbl("Users", bold=True, size=13, color=P.ACCENT))
+
+        b_add  = mk_btn("+ Add User",      P.BTN_ADD)
+        b_del  = mk_btn("- Remove Last",   P.BTN_DEL)
+        b_imp  = mk_btn("Import JSON",     P.BTN_IMP)
+        b_exp  = mk_btn("Export JSON",     P.BTN_EXP)
+
+        cmp_items = ["All vs Baseline", "All vs All (matrix)"]
+        tb.add(lbl("  Mode:", size=11, color=P.DIM))
+        self._cmp_combo = mk_combo(cmp_items)
+        self._cmp_combo.setToolTipText(
+            "All vs Baseline: each user tested against the Baseline user.\n"
+            "All vs All: every pair of users compared.")
+
+        class _Add(ActionListener):
+            def actionPerformed(_s, e): self._add_user()
+        class _Del(ActionListener):
+            def actionPerformed(_s, e): self._remove_last()
+        class _Imp(ActionListener):
+            def actionPerformed(_s, e): self._import_profiles()
+        class _Exp(ActionListener):
+            def actionPerformed(_s, e): self._export_profiles()
+
+        b_add.addActionListener(_Add())
+        b_del.addActionListener(_Del())
+        b_imp.addActionListener(_Imp())
+        b_exp.addActionListener(_Exp())
+
+        for w in [b_add, b_del, b_imp, b_exp, self._cmp_combo]:
+            tb.add(w)
+
+        self.add(tb, BorderLayout.NORTH)
+
+        # ── Scrollable user card area ─────────────────────────
+        self._cards_panel = JPanel()
+        self._cards_panel.setBackground(P.BG_DARK)
+        self._cards_panel.setLayout(BoxLayout(self._cards_panel, BoxLayout.X_AXIS))
+
+        self._scroll = JScrollPane(self._cards_panel)
+        self._scroll.setHorizontalScrollBarPolicy(
+            ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED)
+        self._scroll.setVerticalScrollBarPolicy(
+            ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER)
+        self._scroll.getViewport().setBackground(P.BG_DARK)
+        self._scroll.setBorder(None)
+        self.add(self._scroll, BorderLayout.CENTER)
+
+        # Add two default users
+        self._add_user(label="User A (Baseline)", is_baseline=True)
+        self._add_user(label="User B")
+
+    # internal ref trick for inner classes in Jython
+    _add_user    = None
+    _remove_last = None
+
+    def _add_user(self, label=None, headers=None, is_baseline=False):
+        if len(self._user_panels) >= self.MAX_USERS:
+            JOptionPane.showMessageDialog(
+                self, "Maximum {} users reached.".format(self.MAX_USERS),
+                "Limit", JOptionPane.WARNING_MESSAGE)
+            return
+        idx   = len(self._user_panels)
+        color = P.user_color(idx)
+        if label is None:
+            label = "User {}".format(chr(65 + idx))  # A, B, C …
+        if headers is None:
+            headers = [["Authorization", ""]]
+        profile = UserProfile(label=label, headers=headers, is_baseline=is_baseline)
+
+        ext = self
+        def _baseline_cb(panel):
+            ext._set_baseline(panel)
+
+        panel = UserHeaderPanel(profile, color, on_baseline_cb=_baseline_cb)
+        panel.setPreferredSize(Dimension(460, 165))
+        panel.setMinimumSize(Dimension(460, 165))
+        panel.setMaximumSize(Dimension(460, 165))
+
+        self._user_panels.append(panel)
+        self._cards_panel.add(panel)
+        self._cards_panel.revalidate()
+        self._cards_panel.repaint()
+
+    def _remove_last(self):
+        if len(self._user_panels) <= 1:
+            JOptionPane.showMessageDialog(
+                self, "Need at least one user.", "Info", JOptionPane.INFORMATION_MESSAGE)
+            return
+        panel = self._user_panels.pop()
+        self._cards_panel.remove(panel)
+        self._cards_panel.revalidate()
+        self._cards_panel.repaint()
+
+    def _set_baseline(self, target_panel):
+        """Ensure only one panel is marked as baseline."""
+        for p in self._user_panels:
+            p.set_baseline(p is target_panel)
+
+    def _export_profiles(self):
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Export User Profiles")
+        if chooser.showSaveDialog(self) != JFileChooser.APPROVE_OPTION:
+            return
+        path = chooser.getSelectedFile().getAbsolutePath()
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            profiles = [p.get_profile().to_dict() for p in self._user_panels]
+            data = json.dumps(profiles, indent=2)
+            w = FileWriter(path)
+            w.write(data)
+            w.close()
+            JOptionPane.showMessageDialog(
+                self, "Exported to:\n" + path, "Done",
+                JOptionPane.INFORMATION_MESSAGE)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(
+                self, "Export failed:\n" + str(ex), "Error",
+                JOptionPane.ERROR_MESSAGE)
+
+    def _import_profiles(self):
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Import User Profiles (JSON)")
+        if chooser.showOpenDialog(self) != JFileChooser.APPROVE_OPTION:
+            return
+        path = chooser.getSelectedFile().getAbsolutePath()
+        try:
+            br   = BufferedReader(FileReader(path))
+            lines = []
+            line = br.readLine()
+            while line is not None:
+                lines.append(line)
+                line = br.readLine()
+            br.close()
+            raw      = "\n".join(lines)
+            profiles = json.loads(raw)
+            # Clear existing
+            for p in list(self._user_panels):
+                self._cards_panel.remove(p)
+            self._user_panels = []
+            for d in profiles:
+                prof = UserProfile.from_dict(d)
+                self._add_user(
+                    label       = prof.label,
+                    headers     = prof.headers,
+                    is_baseline = prof.is_baseline,
+                )
+            self._cards_panel.revalidate()
+            self._cards_panel.repaint()
+            JOptionPane.showMessageDialog(
+                self, "Imported {} user(s).".format(len(profiles)),
+                "Done", JOptionPane.INFORMATION_MESSAGE)
+        except Exception as ex:
+            JOptionPane.showMessageDialog(
+                self, "Import failed:\n" + str(ex), "Error",
+                JOptionPane.ERROR_MESSAGE)
+
+    def get_profiles(self):
+        """Return list of UserProfile from all panels (current state)."""
+        return [p.get_profile() for p in self._user_panels]
+
+    def get_comparison_mode(self):
+        return str(self._cmp_combo.getSelectedItem())
+
+
+# Fix Jython self reference in methods defined with `def` inside class body
+# We need to patch _add_user etc. after class is created:
+_orig_add  = UserManagerPanel._add_user
+_orig_del  = UserManagerPanel._remove_last
+UserManagerPanel._add_user    = _orig_add
+UserManagerPanel._remove_last = _orig_del
+
+
+# ─────────────────────────────────────────────────────────────
+#  Dynamic result table
+#  Columns: #, Method, URL, Risk, Pattern, [Ux Status, Ux Len …], Result
+# ─────────────────────────────────────────────────────────────
+BASE_COLS    = ["#", "Method", "URL", "Risk", "Pattern"]
+RESULT_COL_NAME = "Result"
+
 COL_RISK    = 3
 COL_PATTERN = 4
-COL_RESULT  = 9
+
+
+def build_cols(user_labels):
+    """Build column list for given user label list."""
+    cols = list(BASE_COLS)
+    for label in user_labels:
+        short = label[:8]
+        cols.append("St.{}".format(short))
+        cols.append("Len.{}".format(short))
+    cols.append(RESULT_COL_NAME)
+    return cols
 
 
 class ResultsModel(DefaultTableModel):
-    def __init__(self):
-        DefaultTableModel.__init__(self, COLS, 0)
+    def __init__(self, cols):
+        self._cols = cols
+        DefaultTableModel.__init__(self, cols, 0)
+
     def isCellEditable(self, r, c):
         return False
+
     def getColumnClass(self, c):
         return type("")
 
+    def col_result(self):
+        return len(self._cols) - 1
 
-# ─────────────────────────────────────────────────────────────
-#  Cell renderer
-# ─────────────────────────────────────────────────────────────
+
 class ResultRenderer(DefaultTableCellRenderer):
+    def __init__(self, result_col_fn):
+        DefaultTableCellRenderer.__init__(self)
+        self._result_col_fn = result_col_fn
+
     def getTableCellRendererComponent(self, tbl, val, sel, foc, row, col):
         c = DefaultTableCellRenderer.getTableCellRendererComponent(
                 self, tbl, val, sel, foc, row, col)
@@ -225,10 +648,8 @@ class ResultRenderer(DefaultTableCellRenderer):
                 c.setFont(Font("Segoe UI", Font.BOLD, 11))
             elif s == "LOW":
                 c.setForeground(P.DIM)
-            else:
-                c.setForeground(P.DIM)
 
-        elif col == COL_RESULT:
+        elif col == self._result_col_fn():
             if "SAME" in s:
                 c.setForeground(P.RED)
                 c.setFont(Font("Segoe UI", Font.BOLD, 12))
@@ -238,42 +659,41 @@ class ResultRenderer(DefaultTableCellRenderer):
                 c.setForeground(P.DIM)
             elif "ERROR" in s:
                 c.setForeground(P.ORANGE)
+            elif "MIXED" in s:
+                c.setForeground(P.YELLOW)
 
         return c
 
 
 # ─────────────────────────────────────────────────────────────
-#  Background analysis thread
+#  Analysis thread  —  multi-user aware
 # ─────────────────────────────────────────────────────────────
 class AnalysisThread(threading.Thread):
 
-    def __init__(self, ext, messages, token1, token2,
-                 tok_type, tok_name, ignore_pats, smart_filter_on,
+    def __init__(self, ext, messages, profiles, cmp_mode,
+                 ignore_pats, smart_filter_on,
                  model, msg_store, progress_bar, log_fn, on_done_fn):
         threading.Thread.__init__(self)
-        self.daemon       = True
-        self._ext         = ext
-        self._msgs        = messages
-        self._t1          = token1
-        self._t2          = token2
-        self._type        = tok_type
-        self._name        = tok_name
-        self._pats        = ignore_pats
-        self._sf          = smart_filter_on
-        self._model       = model
-        self._store       = msg_store   # dict: row_num -> dict(svc, req1, resp1, req2, resp2)
-        self._pb          = progress_bar
-        self._log         = log_fn
-        self._on_done     = on_done_fn
-        self._counter     = [model.getRowCount() + 1]
+        self.daemon         = True
+        self._ext           = ext
+        self._msgs          = messages
+        self._profiles      = profiles      # list of UserProfile
+        self._cmp_mode      = cmp_mode      # "All vs Baseline" | "All vs All (matrix)"
+        self._pats          = ignore_pats
+        self._sf            = smart_filter_on
+        self._model         = model
+        self._store         = msg_store
+        self._pb            = progress_bar
+        self._log           = log_fn
+        self._on_done       = on_done_fn
+        self._counter       = [model.getRowCount() + 1]
 
     # ── response helpers ──────────────────────────────────────
     def _get_body_str(self, resp_bytes):
         if not resp_bytes:
             return ""
         info = self._ext.helpers.analyzeResponse(resp_bytes)
-        body = self._ext.helpers.bytesToString(resp_bytes[info.getBodyOffset():])
-        return body
+        return self._ext.helpers.bytesToString(resp_bytes[info.getBodyOffset():])
 
     def _body_hash(self, body_str):
         if not body_str:
@@ -297,52 +717,63 @@ class AnalysisThread(threading.Thread):
         info = self._ext.helpers.analyzeResponse(resp_bytes)
         return len(resp_bytes) - info.getBodyOffset()
 
-    # ── token injection ───────────────────────────────────────
-    def _inject(self, req_bytes, svc, token):
-        helpers  = self._ext.helpers
-        info     = helpers.analyzeRequest(svc, req_bytes)
-        headers  = list(info.getHeaders())
-        body     = req_bytes[info.getBodyOffset():]
-        name_lo  = self._name.lower()
+    def _inject(self, req_bytes, svc, header_pairs):
+        """
+        Inject all header_pairs into the request.
+        Each pair is [name, value].
+        Cookies in header_pairs should be listed as ["Cookie", "k=v; k2=v2"].
+        If a header already exists, replace its value.
+        If not, append it.
+        """
+        helpers = self._ext.helpers
+        info    = helpers.analyzeRequest(svc, req_bytes)
+        headers = list(info.getHeaders())
+        body    = req_bytes[info.getBodyOffset():]
 
-        if self._type == "Header":
+        for hdr_name, hdr_value in header_pairs:
+            name_lo  = hdr_name.lower()
             new_hdrs = []
             replaced = False
-            for h in headers:
-                if h.lower().startswith(name_lo + ":"):
-                    new_hdrs.append("{}: {}".format(self._name, token))
-                    replaced = True
-                else:
-                    new_hdrs.append(h)
-            if not replaced:
-                new_hdrs.append("{}: {}".format(self._name, token))
-            return helpers.buildHttpMessage(new_hdrs, body)
 
-        else:  # Cookie
-            new_hdrs     = []
-            cookie_added = False
-            for h in headers:
-                if h.lower().startswith("cookie:"):
-                    parts    = [x.strip() for x in h[7:].strip().split(";")]
-                    new_ck   = []
-                    replaced = False
-                    for part in parts:
-                        if "=" in part:
-                            k, _, v = part.partition("=")
-                            if k.strip().lower() == name_lo:
-                                new_ck.append("{}={}".format(self._name, token))
-                                replaced = True
-                                continue
-                        new_ck.append(part)
-                    if not replaced:
-                        new_ck.append("{}={}".format(self._name, token))
-                    new_hdrs.append("Cookie: " + "; ".join(new_ck))
-                    cookie_added = True
-                else:
-                    new_hdrs.append(h)
-            if not cookie_added:
-                new_hdrs.append("Cookie: {}={}".format(self._name, token))
-            return helpers.buildHttpMessage(new_hdrs, body)
+            if name_lo == "cookie":
+                # Merge cookies with existing Cookie header
+                for h in headers:
+                    if h.lower().startswith("cookie:"):
+                        existing_pairs = [x.strip() for x in h[7:].strip().split(";")]
+                        # Build dict of existing cookies, then overlay new ones
+                        ck_dict = {}
+                        for part in existing_pairs:
+                            if "=" in part:
+                                k, _, v = part.partition("=")
+                                ck_dict[k.strip()] = v.strip()
+                        # New cookies override existing
+                        for part in hdr_value.split(";"):
+                            part = part.strip()
+                            if "=" in part:
+                                k, _, v = part.partition("=")
+                                ck_dict[k.strip()] = v.strip()
+                        merged = "; ".join("{}={}".format(k, v)
+                                           for k, v in ck_dict.items())
+                        new_hdrs.append("Cookie: " + merged)
+                        replaced = True
+                    else:
+                        new_hdrs.append(h)
+                if not replaced:
+                    new_hdrs.append("Cookie: " + hdr_value)
+                headers = new_hdrs
+
+            else:
+                for h in headers:
+                    if h.lower().startswith(name_lo + ":"):
+                        new_hdrs.append("{}: {}".format(hdr_name, hdr_value))
+                        replaced = True
+                    else:
+                        new_hdrs.append(h)
+                if not replaced:
+                    new_hdrs.append("{}: {}".format(hdr_name, hdr_value))
+                headers = new_hdrs
+
+        return helpers.buildHttpMessage(headers, body)
 
     def _send(self, svc, req_bytes):
         try:
@@ -351,7 +782,6 @@ class AnalysisThread(threading.Thread):
             self._log("[!] Network error: {}".format(e))
             return None
 
-    # ── EDT push helpers ──────────────────────────────────────
     def _add_row(self, row_data):
         self._model.addRow(row_data)
 
@@ -359,13 +789,38 @@ class AnalysisThread(threading.Thread):
         self._pb.setValue(val)
         self._pb.setString(text)
 
+    # ── pair generator ────────────────────────────────────────
+    def _get_pairs(self):
+        """
+        Returns list of (profile_a, profile_b) to compare.
+        In "All vs Baseline": baseline vs each non-baseline.
+        In "All vs All": every combination i < j.
+        """
+        profiles = self._profiles
+        pairs    = []
+        if "Baseline" in self._cmp_mode:
+            baseline = next((p for p in profiles if p.is_baseline), None)
+            if baseline is None and profiles:
+                baseline = profiles[0]
+            for p in profiles:
+                if p is not baseline:
+                    pairs.append((baseline, p))
+        else:
+            for i in range(len(profiles)):
+                for j in range(i + 1, len(profiles)):
+                    pairs.append((profiles[i], profiles[j]))
+        return pairs
+
     # ── main loop ─────────────────────────────────────────────
     def run(self):
-        total  = len(self._msgs)
-        tested = 0
-        skip_c = 0
+        total     = len(self._msgs)
+        tested    = 0
+        skip_c    = 0
+        profiles  = self._profiles
+        n_users   = len(profiles)
 
-        self._log("[*] Received {} request(s)".format(total))
+        self._log("[*] Received {} request(s) | {} user(s) | mode: {}".format(
+            total, n_users, self._cmp_mode))
 
         for idx, msg in enumerate(self._msgs):
             try:
@@ -377,7 +832,6 @@ class AnalysisThread(threading.Thread):
 
                 # ── Smart Filter ──────────────────────────
                 should_test, risk, pattern = smart_filter(method, url)
-
                 if self._sf and not should_test:
                     skip_c += 1
                     self._log("[~] SKIP  {} {}  ({})".format(method, url, pattern))
@@ -390,48 +844,75 @@ class AnalysisThread(threading.Thread):
 
                 self._log("[>] TEST  {} {}  [{}]".format(method, url, risk))
 
-                req1 = self._inject(req_bytes, svc, self._t1)
-                req2 = self._inject(req_bytes, svc, self._t2)
+                # ── Send request for each user ─────────────
+                user_reqs   = []
+                user_resps  = []
+                user_status = []
+                user_len    = []
+                user_hash   = []
+                user_body   = []
 
-                r1 = self._send(svc, req1)
-                r2 = self._send(svc, req2)
+                for prof in profiles:
+                    req  = self._inject(req_bytes, svc, prof.headers)
+                    resp = self._send(svc, req)
+                    rb   = resp.getResponse() if resp else None
+                    bs   = self._get_body_str(rb)
+                    user_reqs.append(req)
+                    user_resps.append(rb)
+                    user_status.append(self._status(rb))
+                    user_len.append(self._body_len(rb))
+                    user_hash.append(self._body_hash(bs))
+                    user_body.append(bs)
 
-                rb1 = r1.getResponse() if r1 else None
-                rb2 = r2.getResponse() if r2 else None
+                # ── Compare pairs ─────────────────────────
+                pairs      = self._get_pairs()
+                same_pairs = []
+                diff_pairs = []
+                for pa, pb in pairs:
+                    ia = profiles.index(pa)
+                    ib = profiles.index(pb)
+                    same = (user_status[ia] == user_status[ib] and
+                            user_hash[ia]   == user_hash[ib])
+                    label = "{} vs {}".format(pa.label, pb.label)
+                    if same:
+                        same_pairs.append(label)
+                    else:
+                        diff_pairs.append(label)
 
-                s1, s2     = self._status(rb1), self._status(rb2)
-                l1, l2     = self._body_len(rb1), self._body_len(rb2)
-                body1_str  = self._get_body_str(rb1)
-                body2_str  = self._get_body_str(rb2)
-                h1         = self._body_hash(body1_str)
-                h2         = self._body_hash(body2_str)
-
-                if s1 == s2 and h1 == h2:
-                    result = "SAME - Possible BAC/IDOR"
+                if same_pairs and not diff_pairs:
+                    result = "SAME — Possible BAC/IDOR [{}]".format(
+                        ", ".join(same_pairs))
                     self._log("  [!!] SAME  [{}]  {}".format(risk, url))
+                elif same_pairs and diff_pairs:
+                    result = "MIXED — SAME: {} | Different: {}".format(
+                        ", ".join(same_pairs), ", ".join(diff_pairs))
+                    self._log("  [?] MIXED  [{}]  {}".format(risk, url))
                 else:
-                    result = "Different"
-                    self._log("  [+] Different (OK)")
+                    result = "Different (OK)"
+                    self._log("  [+] Different")
 
                 row_num = self._counter[0]
                 self._counter[0] += 1
                 tested  += 1
 
-                # Store full request/response bytes for POC viewer
-                self._store[row_num] = {
-                    "svc":   svc,
-                    "req1":  req1,
-                    "resp1": rb1,
-                    "req2":  req2,
-                    "resp2": rb2,
-                }
+                # Build store entry with all user req/resp
+                store_entry = {"svc": svc, "users": []}
+                for i, prof in enumerate(profiles):
+                    store_entry["users"].append({
+                        "label": prof.label,
+                        "req":   user_reqs[i],
+                        "resp":  user_resps[i],
+                    })
+                self._store[row_num] = store_entry
 
-                row = [row_num, method, url, risk, pattern,
-                       s1, l1, s2, l2, result]
+                # ── Build row ─────────────────────────────
+                row = [row_num, method, url, risk, pattern]
+                for i in range(n_users):
+                    row.append(user_status[i])
+                    row.append(user_len[i])
+                row.append(result)
 
-                SwingUtilities.invokeLater(
-                    lambda r=row: self._add_row(r)
-                )
+                SwingUtilities.invokeLater(lambda r=row: self._add_row(r))
 
             except Exception:
                 self._log("[!] Error on #{}: {}".format(
@@ -445,9 +926,7 @@ class AnalysisThread(threading.Thread):
 
         summary = "Done — tested:{} skipped:{} total:{}".format(
             tested, skip_c, total)
-        SwingUtilities.invokeLater(
-            lambda: self._set_progress(0, summary)
-        )
+        SwingUtilities.invokeLater(lambda: self._set_progress(0, summary))
         self._log("[*] " + summary)
         if self._on_done:
             SwingUtilities.invokeLater(self._on_done)
@@ -455,14 +934,8 @@ class AnalysisThread(threading.Thread):
 
 # ─────────────────────────────────────────────────────────────
 #  Message editor controller
-#  Required by Burp's native IMessageEditor (gives Repeater-style
-#  rendering, syntax highlighting, "Pretty/Raw/Hex" tabs for free).
-#  Each pane (Token1-Req, Token1-Resp, Token2-Req, Token2-Resp)
-#  gets its own controller instance pointing at the stored bytes.
 # ─────────────────────────────────────────────────────────────
 class StaticMessageController(IMessageEditorController):
-    """A controller that always returns a fixed, pre-stored message."""
-
     def __init__(self):
         self._svc  = None
         self._req  = None
@@ -473,21 +946,14 @@ class StaticMessageController(IMessageEditorController):
         self._req  = req_bytes
         self._resp = resp_bytes
 
-    def getHttpService(self):
-        return self._svc
-
-    def getRequest(self):
-        return self._req
-
-    def getResponse(self):
-        return self._resp
+    def getHttpService(self):  return self._svc
+    def getRequest(self):      return self._req
+    def getResponse(self):     return self._resp
 
 
 # ─────────────────────────────────────────────────────────────
-#  Repeater-style PoC panel
-#  Two side-by-side columns (Token 1 | Token 2), each with a
-#  vertical split: Request on top, Response on bottom — exactly
-#  like Burp Repeater — using Burp's own native message editors.
+#  Multi-user POC Panel
+#  Dynamically creates one column per user (Request | Response)
 # ─────────────────────────────────────────────────────────────
 class PocPanel(JPanel):
 
@@ -500,83 +966,102 @@ class PocPanel(JPanel):
         hdr = JPanel(FlowLayout(FlowLayout.LEFT, 6, 2))
         hdr.setBackground(P.BG_DARK)
         hdr.add(lbl("Proof of Concept", bold=True, size=12, color=P.DIM))
-        hdr.add(lbl("  (click a row above to load Request/Response for both tokens)",
+        hdr.add(lbl("  (click a row above to load Request/Response per user)",
                     size=11, color=P.DIM))
         self.add(hdr, BorderLayout.NORTH)
 
-        # Controllers hold the raw bytes that the editors read from
-        self._ctrl_req1  = StaticMessageController()
-        self._ctrl_resp1 = StaticMessageController()
-        self._ctrl_req2  = StaticMessageController()
-        self._ctrl_resp2 = StaticMessageController()
+        self._split_center = JPanel(BorderLayout())
+        self._split_center.setBackground(P.BG_DARK)
+        self.add(self._split_center, BorderLayout.CENTER)
 
-        # Native Burp message editors (read-only)
-        self._editor_req1  = callbacks.createMessageEditor(self._ctrl_req1,  False)
-        self._editor_resp1 = callbacks.createMessageEditor(self._ctrl_resp1, False)
-        self._editor_req2  = callbacks.createMessageEditor(self._ctrl_req2,  False)
-        self._editor_resp2 = callbacks.createMessageEditor(self._ctrl_resp2, False)
+        # Current editors
+        self._editors = []   # list of dicts with ctrl_req, ctrl_resp, ed_req, ed_resp
 
-        col1 = self._make_column("Token 1", self._editor_req1, self._editor_resp1, P.ACCENT)
-        col2 = self._make_column("Token 2", self._editor_req2, self._editor_resp2, P.ACCENT2)
+    def _build_columns(self, user_labels):
+        """Rebuild editor columns for given user label list."""
+        self._split_center.removeAll()
+        self._editors = []
 
-        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, col1, col2)
-        split.setResizeWeight(0.5)
-        split.setBackground(P.BG_DARK)
-        split.setBorder(None)
-        split.setDividerSize(4)
-        self.add(split, BorderLayout.CENTER)
+        n = len(user_labels)
+        if n == 0:
+            return
 
-    def _make_column(self, title, req_editor, resp_editor, accent):
-        outer = JPanel(BorderLayout())
-        outer.setBackground(P.BG_DARK)
+        # Build each column
+        cols_panel = JPanel(GridLayout(1, n, 4, 0))
+        cols_panel.setBackground(P.BG_DARK)
 
-        title_p = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
-        title_p.setBackground(P.BG_PANEL)
-        title_p.add(lbl(title, bold=True, size=12, color=accent))
-        outer.add(title_p, BorderLayout.NORTH)
+        for i, label in enumerate(user_labels):
+            color    = P.user_color(i)
+            ctrl_req  = StaticMessageController()
+            ctrl_resp = StaticMessageController()
+            ed_req    = self._callbacks.createMessageEditor(ctrl_req,  False)
+            ed_resp   = self._callbacks.createMessageEditor(ctrl_resp, False)
+            self._editors.append({
+                "ctrl_req": ctrl_req, "ctrl_resp": ctrl_resp,
+                "ed_req":   ed_req,   "ed_resp":   ed_resp,
+            })
 
-        req_panel  = self._wrap("Request",  req_editor.getComponent())
-        resp_panel = self._wrap("Response", resp_editor.getComponent())
+            col   = JPanel(BorderLayout())
+            col.setBackground(P.BG_DARK)
+            title = JPanel(FlowLayout(FlowLayout.LEFT, 4, 2))
+            title.setBackground(P.BG_PANEL)
+            title.add(lbl(label, bold=True, size=11, color=color))
+            col.add(title, BorderLayout.NORTH)
 
-        vsplit = JSplitPane(JSplitPane.VERTICAL_SPLIT, req_panel, resp_panel)
-        vsplit.setResizeWeight(0.5)
-        vsplit.setBackground(P.BG_DARK)
-        vsplit.setBorder(None)
-        vsplit.setDividerSize(4)
-        outer.add(vsplit, BorderLayout.CENTER)
-        return outer
+            req_p  = self._wrap("Request",  ed_req.getComponent(),  color)
+            resp_p = self._wrap("Response", ed_resp.getComponent(), color)
 
-    def _wrap(self, title, component):
+            vsplit = JSplitPane(JSplitPane.VERTICAL_SPLIT, req_p, resp_p)
+            vsplit.setResizeWeight(0.5)
+            vsplit.setBackground(P.BG_DARK)
+            vsplit.setBorder(None)
+            vsplit.setDividerSize(4)
+            col.add(vsplit, BorderLayout.CENTER)
+            cols_panel.add(col)
+
+        sc = JScrollPane(cols_panel)
+        sc.getViewport().setBackground(P.BG_DARK)
+        sc.setBorder(None)
+        sc.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED)
+        self._split_center.add(sc, BorderLayout.CENTER)
+        self._split_center.revalidate()
+        self._split_center.repaint()
+
+    def _wrap(self, title, component, color):
         p = JPanel(BorderLayout())
         p.setBackground(P.BG_DARK)
         hdr = JPanel(FlowLayout(FlowLayout.LEFT, 4, 1))
         hdr.setBackground(P.BG_PANEL)
-        hdr.add(lbl(title, bold=True, size=10, color=P.TEXT))
+        hdr.add(lbl(title, bold=True, size=10, color=color))
         p.add(hdr, BorderLayout.NORTH)
         p.add(component, BorderLayout.CENTER)
         p.setBorder(BorderFactory.createLineBorder(P.BORDER, 1))
         return p
 
-    def show_poc(self, svc, req1, resp1, req2, resp2):
-        """Call from EDT only. Any of req/resp may be None."""
+    def show_poc(self, svc, user_data_list):
+        """
+        user_data_list: list of dicts {"label", "req", "resp"}
+        """
+        labels = [u["label"] for u in user_data_list]
+        # Rebuild columns if user count changed
+        if len(user_data_list) != len(self._editors):
+            self._build_columns(labels)
+
         empty = jarray.array([], "b")
-
-        self._ctrl_req1.set_data(svc, req1, None)
-        self._ctrl_resp1.set_data(svc, req1, resp1)
-        self._ctrl_req2.set_data(svc, req2, None)
-        self._ctrl_resp2.set_data(svc, req2, resp2)
-
-        self._editor_req1.setMessage(req1 if req1 else empty, True)
-        self._editor_resp1.setMessage(resp1 if resp1 else empty, False)
-        self._editor_req2.setMessage(req2 if req2 else empty, True)
-        self._editor_resp2.setMessage(resp2 if resp2 else empty, False)
+        for i, ud in enumerate(user_data_list):
+            ed   = self._editors[i]
+            req  = ud.get("req")
+            resp = ud.get("resp")
+            ed["ctrl_req"].set_data(svc,  req,  None)
+            ed["ctrl_resp"].set_data(svc, req,  resp)
+            ed["ed_req"].setMessage(req   if req  else empty, True)
+            ed["ed_resp"].setMessage(resp if resp else empty, False)
 
     def clear(self):
         empty = jarray.array([], "b")
-        self._editor_req1.setMessage(empty, True)
-        self._editor_resp1.setMessage(empty, False)
-        self._editor_req2.setMessage(empty, True)
-        self._editor_resp2.setMessage(empty, False)
+        for ed in self._editors:
+            ed["ed_req"].setMessage(empty,  True)
+            ed["ed_resp"].setMessage(empty, False)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -589,13 +1074,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         self.helpers   = callbacks.getHelpers()
         callbacks.setExtensionName("TokenTwin Checker")
 
-        self._stdout   = PrintWriter(callbacks.getStdout(), True)
-        self._log("TokenTwin Checker v3.0 loaded")
+        self._stdout    = PrintWriter(callbacks.getStdout(), True)
+        self._log("TokenTwin Checker v4.0 loaded  (Multi-User + Header Manager)")
 
-        # msg_store: row_number -> dict(svc, req1, resp1, req2, resp2)
         self._msg_store = {}
-
-        self._ui_ready = threading.Event()
+        self._ui_ready  = threading.Event()
         SwingUtilities.invokeLater(self._build_ui)
         self._ui_ready.wait(5)
 
@@ -603,11 +1086,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         callbacks.addSuiteTab(self)
 
     # ── ITab ─────────────────────────────────────────────────
-    def getTabCaption(self):
-        return "TokenTwin"
-
-    def getUiComponent(self):
-        return self._root
+    def getTabCaption(self):  return "TokenTwin"
+    def getUiComponent(self): return self._root
 
     # ── IContextMenuFactory ───────────────────────────────────
     def createMenuItems(self, inv):
@@ -647,15 +1127,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         self._root.setBackground(P.BG_DARK)
         self._root.add(self._make_banner(), BorderLayout.NORTH)
 
-        # Top: config
-        # Middle: table
-        # Bottom: diff viewer + log  (split)
         top_split = JSplitPane(
             JSplitPane.VERTICAL_SPLIT,
             self._make_config_panel(),
             self._make_center_split()
         )
-        top_split.setDividerLocation(185)
+        top_split.setDividerLocation(215)
         top_split.setResizeWeight(0.0)
         top_split.setBackground(P.BG_DARK)
         top_split.setBorder(None)
@@ -669,78 +1146,72 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         p.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, P.BORDER))
         p.add(lbl("TokenTwin Checker", bold=True, size=18, color=P.ACCENT))
         p.add(lbl("|", color=P.BORDER))
-        p.add(lbl("v3.0  |  BAC / IDOR Hunter", size=12, color=P.DIM))
+        p.add(lbl("v4.0  |  Multi-User BAC / IDOR Hunter", size=12, color=P.DIM))
         return p
 
     # ── Config panel ──────────────────────────────────────────
     def _make_config_panel(self):
+        """
+        Top section split into:
+          LEFT  — UserManagerPanel (user cards)
+          RIGHT — options (ignore regex, smart filter, progress, buttons)
+        """
         outer = JPanel(BorderLayout())
         outer.setBackground(P.BG_DARK)
-        outer.setBorder(EmptyBorder(8, 10, 4, 10))
+        outer.setBorder(EmptyBorder(6, 10, 4, 10))
 
-        inner = JPanel(GridBagLayout())
-        inner.setBackground(P.BG_PANEL)
-        inner.setBorder(BorderFactory.createCompoundBorder(
+        # Left: user manager
+        self._user_mgr = UserManagerPanel()
+        self._user_mgr.setPreferredSize(Dimension(0, 190))
+
+        # Right: options pane
+        opt = JPanel(GridBagLayout())
+        opt.setBackground(P.BG_PANEL)
+        opt.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createLineBorder(P.BORDER, 1),
-            EmptyBorder(10, 14, 10, 14)
+            EmptyBorder(8, 10, 8, 10)
         ))
+        opt.setPreferredSize(Dimension(340, 190))
+        opt.setMinimumSize(Dimension(300, 170))
 
         g = GridBagConstraints()
-        g.insets = Insets(4, 5, 4, 5)
-        g.fill   = GridBagConstraints.HORIZONTAL
-        g.anchor = GridBagConstraints.WEST
+        g.insets  = Insets(3, 4, 3, 4)
+        g.fill    = GridBagConstraints.HORIZONTAL
+        g.anchor  = GridBagConstraints.WEST
 
-        # Row 0 — token type + name
+        # Ignore regex
         g.gridx, g.gridy, g.gridwidth = 0, 0, 1
-        inner.add(lbl("Type:", bold=True), g)
-        g.gridx = 1
-        self._type_combo = mk_combo(["Header", "Cookie"])
-        inner.add(self._type_combo, g)
-        g.gridx = 2
-        inner.add(lbl("Name:", bold=True), g)
-        g.gridx = 3; g.gridwidth = 3
-        self._name_field = fld(22)
-        self._name_field.setText("Authorization")
-        inner.add(self._name_field, g)
-
-        # Row 1 — Token 1
-        g.gridx, g.gridy, g.gridwidth = 0, 1, 1
-        inner.add(lbl("Token 1:", bold=True, color=P.ACCENT), g)
-        g.gridx = 1; g.gridwidth = 5
-        self._t1_field = fld(60)
-        inner.add(self._t1_field, g)
-
-        # Row 2 — Token 2
-        g.gridx, g.gridy, g.gridwidth = 0, 2, 1
-        inner.add(lbl("Token 2:", bold=True, color=P.ACCENT2), g)
-        g.gridx = 1; g.gridwidth = 5
-        self._t2_field = fld(60)
-        inner.add(self._t2_field, g)
-
-        # Row 3 — Ignore patterns + smart filter toggle
-        g.gridx, g.gridy, g.gridwidth = 0, 3, 1
-        inner.add(lbl("Ignore regex:", bold=True), g)
+        opt.add(lbl("Ignore regex:", bold=True, size=11), g)
         g.gridx = 1; g.gridwidth = 3
-        self._ignore_field = fld(40)
-        self._ignore_field.setText('"nonce":"[^"]*"|"timestamp":\\d+')
+        self._ignore_field = fld(30, '"nonce":"[^"]*"|"timestamp":\\d+')
         self._ignore_field.setToolTipText(
             "Pipe-separated regex patterns stripped from body before hash comparison")
-        inner.add(self._ignore_field, g)
+        opt.add(self._ignore_field, g)
 
-        g.gridx = 4; g.gridwidth = 2
-        self._sf_cb = mk_cb("Smart Filter (skip static/irrelevant)")
+        # Smart filter
+        g.gridx, g.gridy, g.gridwidth = 0, 1, 4
+        self._sf_cb = mk_cb("Smart Filter (skip static/irrelevant endpoints)")
         self._sf_cb.setSelected(True)
-        inner.add(self._sf_cb, g)
+        opt.add(self._sf_cb, g)
 
-        # Row 4 — buttons + progress
-        g.gridx, g.gridy, g.gridwidth = 0, 4, 1
+        # Progress bar
+        g.gridx, g.gridy, g.gridwidth = 0, 2, 4
+        self._pb = JProgressBar(0, 100)
+        self._pb.setStringPainted(True)
+        self._pb.setString("Ready")
+        self._pb.setBackground(P.BG_FIELD)
+        self._pb.setForeground(P.ACCENT)
+        self._pb.setBorder(BorderFactory.createLineBorder(P.BORDER, 1))
+        self._pb.setPreferredSize(Dimension(0, 18))
+        opt.add(self._pb, g)
 
-        b_save = mk_btn("Save Tokens", P.BTN_SAVE)
-        b_clr  = mk_btn("Clear All",   P.BTN_CLR)
-        b_exp  = mk_btn("Export CSV",  P.BTN_EXP)
+        # Buttons
+        b_run  = mk_btn("▶ Run Test",   P.ACCENT)
+        b_clr  = mk_btn("Clear All",    P.BTN_CLR)
+        b_exp  = mk_btn("Export CSV",   P.BTN_EXP)
 
-        class _Save(ActionListener):
-            def actionPerformed(_s, e): self._save_tokens()
+        class _Run(ActionListener):
+            def actionPerformed(_s, e): self._run_from_stored()
         class _Clr(ActionListener):
             def actionPerformed(_s, e):
                 self._model.setRowCount(0)
@@ -750,33 +1221,29 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         class _Exp(ActionListener):
             def actionPerformed(_s, e): self._export_csv()
 
-        b_save.addActionListener(_Save())
+        b_run.addActionListener(_Run())
         b_clr.addActionListener(_Clr())
         b_exp.addActionListener(_Exp())
+        b_run.setToolTipText("Re-run test on last received requests with current user config")
 
+        g.gridx, g.gridy, g.gridwidth = 0, 3, 4
         btn_row = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
         btn_row.setBackground(P.BG_PANEL)
-        btn_row.add(b_save)
-        btn_row.add(b_clr)
-        btn_row.add(b_exp)
-        g.gridwidth = 6
-        inner.add(btn_row, g)
+        for b in [b_run, b_clr, b_exp]:
+            btn_row.add(b)
+        opt.add(btn_row, g)
 
-        # Row 5 — progress bar
-        g.gridx, g.gridy, g.gridwidth = 0, 5, 6
-        self._pb = JProgressBar(0, 100)
-        self._pb.setStringPainted(True)
-        self._pb.setString("Ready")
-        self._pb.setBackground(P.BG_FIELD)
-        self._pb.setForeground(P.ACCENT)
-        self._pb.setBorder(BorderFactory.createLineBorder(P.BORDER, 1))
-        self._pb.setPreferredSize(Dimension(0, 18))
-        inner.add(self._pb, g)
+        split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT, self._user_mgr, opt)
+        split.setDividerLocation(700)
+        split.setResizeWeight(0.75)
+        split.setBackground(P.BG_DARK)
+        split.setBorder(None)
+        split.setDividerSize(5)
 
-        outer.add(inner, BorderLayout.CENTER)
+        outer.add(split, BorderLayout.CENTER)
         return outer
 
-    # ── Center: table | (diff + log) ─────────────────────────
+    # ── Center: table | poc | log ─────────────────────────────
     def _make_center_split(self):
         bottom = JSplitPane(
             JSplitPane.VERTICAL_SPLIT,
@@ -805,15 +1272,15 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         p.setBackground(P.BG_DARK)
         p.setBorder(EmptyBorder(4, 10, 2, 10))
 
-        # Header row with filter buttons
         hdr = JPanel(FlowLayout(FlowLayout.LEFT, 8, 3))
         hdr.setBackground(P.BG_DARK)
         hdr.add(lbl("Results", bold=True, size=13, color=P.ACCENT))
         hdr.add(lbl("  Filter:", size=11, color=P.DIM))
 
-        self._filter_all      = self._filter_btn("All")
-        self._filter_same     = self._filter_btn("SAME only")
-        self._filter_high     = self._filter_btn("HIGH risk only")
+        self._filter_all  = self._filter_btn("All")
+        self._filter_same = self._filter_btn("SAME only")
+        self._filter_high = self._filter_btn("HIGH risk only")
+        self._filter_mix  = self._filter_btn("MIXED only")
 
         class _FA(ActionListener):
             def actionPerformed(_s, e): self._apply_filter("all")
@@ -821,18 +1288,23 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             def actionPerformed(_s, e): self._apply_filter("same")
         class _FH(ActionListener):
             def actionPerformed(_s, e): self._apply_filter("high")
+        class _FM(ActionListener):
+            def actionPerformed(_s, e): self._apply_filter("mixed")
 
         self._filter_all.addActionListener(_FA())
         self._filter_same.addActionListener(_FS())
         self._filter_high.addActionListener(_FH())
+        self._filter_mix.addActionListener(_FM())
         self._active_filter = "all"
 
-        hdr.add(self._filter_all)
-        hdr.add(self._filter_same)
-        hdr.add(self._filter_high)
+        for b in [self._filter_all, self._filter_same,
+                  self._filter_high, self._filter_mix]:
+            hdr.add(b)
         p.add(hdr, BorderLayout.NORTH)
 
-        self._model = ResultsModel()
+        # Build with dummy 2-user columns initially; rebuilt on each run
+        init_cols  = build_cols(["User A", "User B"])
+        self._model = ResultsModel(init_cols)
         self._table = JTable(self._model)
         self._table.setBackground(P.BG_PANEL)
         self._table.setForeground(P.TEXT)
@@ -850,15 +1322,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         th.setForeground(P.ACCENT)
         th.setFont(Font("Segoe UI", Font.BOLD, 11))
 
-        rr = ResultRenderer()
+        rr = ResultRenderer(lambda: self._model.col_result())
         cm = self._table.getColumnModel()
-        for i in range(len(COLS)):
+        for i in range(len(init_cols)):
             cm.getColumn(i).setCellRenderer(rr)
 
-        for i, w in enumerate([30, 58, 280, 55, 160, 52, 52, 52, 52, 175]):
-            cm.getColumn(i).setPreferredWidth(w)
-
-        # Row selection → POC viewer
         ext_ref = self
 
         class _Sel(ListSelectionListener):
@@ -868,7 +1336,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                 view_row = ext_ref._table.getSelectedRow()
                 if view_row < 0:
                     return
-                # Convert view row to model row (RowSorter may be filtering/sorting)
                 try:
                     model_row = ext_ref._table.convertRowIndexToModel(view_row)
                 except Exception:
@@ -880,10 +1347,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                     return
                 data = ext_ref._msg_store.get(row_num)
                 if data:
-                    ext_ref._poc_panel.show_poc(
-                        data["svc"], data["req1"], data["resp1"],
-                        data["req2"], data["resp2"]
-                    )
+                    ext_ref._poc_panel.show_poc(data["svc"], data["users"])
 
         self._table.getSelectionModel().addListSelectionListener(_Sel())
 
@@ -907,10 +1371,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
     def _apply_filter(self, mode):
         self._active_filter = mode
-        # Highlight active button
         for b, m in [(self._filter_all,  "all"),
                      (self._filter_same, "same"),
-                     (self._filter_high, "high")]:
+                     (self._filter_high, "high"),
+                     (self._filter_mix,  "mixed")]:
             if m == mode:
                 b.setBackground(P.ACCENT)
                 b.setForeground(Color(0x1E, 0x1E, 0x2E))
@@ -918,31 +1382,32 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                 b.setBackground(P.BG_FIELD)
                 b.setForeground(P.TEXT)
 
-        # Hide rows not matching filter by adjusting row visibility
-        # JTable has no native row hiding – we use RowFilter via TableRowSorter
-        # But to keep Jython-safe, we rebuild a view model instead.
-        # Simple approach: use row sorter with RowFilter
         import javax.swing.table as jst
-        import javax.swing as jsw
-
         sorter = jst.TableRowSorter(self._model)
         self._table.setRowSorter(sorter)
+        rc = self._model.col_result()
 
         if mode == "all":
             sorter.setRowFilter(None)
         elif mode == "same":
             class _F(jst.RowFilter):
                 def include(_self, entry):
-                    v = str(entry.getValue(COL_RESULT) or "")
+                    v = str(entry.getValue(rc) or "")
                     return "SAME" in v
             sorter.setRowFilter(_F())
         elif mode == "high":
             class _F2(jst.RowFilter):
                 def include(_self, entry):
                     risk   = str(entry.getValue(COL_RISK) or "")
-                    result = str(entry.getValue(COL_RESULT) or "")
+                    result = str(entry.getValue(rc) or "")
                     return risk == "HIGH" and "SAME" in result
             sorter.setRowFilter(_F2())
+        elif mode == "mixed":
+            class _F3(jst.RowFilter):
+                def include(_self, entry):
+                    v = str(entry.getValue(rc) or "")
+                    return "MIXED" in v
+            sorter.setRowFilter(_F3())
 
     # ── POC panel ─────────────────────────────────────────────
     def _make_poc_panel(self):
@@ -978,62 +1443,105 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
     # ─────────────────────────────────────────────────────────
     #  Actions
     # ─────────────────────────────────────────────────────────
-    def _save_tokens(self):
-        t1 = self._t1_field.getText().strip()
-        t2 = self._t2_field.getText().strip()
-        if not t1 or not t2:
-            JOptionPane.showMessageDialog(
-                self._root, "Both tokens must be filled in.",
-                "Missing Tokens", JOptionPane.WARNING_MESSAGE)
-            return
-        n = self._name_field.getText().strip()
-        self._log("[*] Tokens saved  |  Type:{}  Name:{}".format(
-            self._type_combo.getSelectedItem(), n or "(empty)"))
-        JOptionPane.showMessageDialog(
-            self._root,
-            "Tokens saved.\n\nRight-click any request and choose\n"
-            "\"Send to TokenTwin Checker\" to test.",
-            "Saved", JOptionPane.INFORMATION_MESSAGE)
-
     def _get_ignore_pats(self):
         raw = self._ignore_field.getText().strip()
         return [x.strip() for x in raw.split("|") if x.strip()] if raw else []
 
+    def _rebuild_model(self, profiles):
+        """Rebuild result table columns for the given user list."""
+        labels    = [p.label for p in profiles]
+        new_cols  = build_cols(labels)
+        new_model = ResultsModel(new_cols)
+
+        self._model = new_model
+        self._table.setModel(new_model)
+
+        # Re-apply renderer
+        rr = ResultRenderer(lambda: self._model.col_result())
+        cm = self._table.getColumnModel()
+        for i in range(len(new_cols)):
+            cm.getColumn(i).setCellRenderer(rr)
+
+        # Auto column widths
+        base_widths = [30, 58, 280, 55, 160]
+        for _ in labels:
+            base_widths.extend([52, 60])
+        base_widths.append(220)
+        for i, w in enumerate(base_widths[:len(new_cols)]):
+            cm.getColumn(i).setPreferredWidth(w)
+
     def _enqueue(self, messages):
-        t1 = self._t1_field.getText().strip()
-        t2 = self._t2_field.getText().strip()
-        if not t1 or not t2:
+        profiles = self._user_mgr.get_profiles()
+        if not profiles:
             JOptionPane.showMessageDialog(
-                self._root, "Please fill in both tokens first.",
-                "Tokens Not Set", JOptionPane.WARNING_MESSAGE)
+                self._root, "Add at least one user.",
+                "No Users", JOptionPane.WARNING_MESSAGE)
             return
 
-        tok_type = str(self._type_combo.getSelectedItem())
-        tok_name = self._name_field.getText().strip()
-        if not tok_name:
-            tok_name = "Authorization" if tok_type == "Header" else "session"
+        # Validate: every user must have at least one non-empty header
+        for prof in profiles:
+            pairs = prof.headers
+            has_value = any(v.strip() for _, v in pairs)
+            if not has_value:
+                JOptionPane.showMessageDialog(
+                    self._root,
+                    "User '{}' has no header values set.\n"
+                    "Please fill in at least one header value.".format(prof.label),
+                    "Missing Header Value", JOptionPane.WARNING_MESSAGE)
+                return
+
+        cmp_mode = self._user_mgr.get_comparison_mode()
+
+        # If "All vs Baseline" but no baseline set, warn
+        if "Baseline" in cmp_mode:
+            if not any(p.is_baseline for p in profiles):
+                JOptionPane.showMessageDialog(
+                    self._root,
+                    "No user is marked as Baseline.\n"
+                    "The first user will be used as Baseline.",
+                    "Baseline Not Set", JOptionPane.WARNING_MESSAGE)
+                profiles[0].is_baseline = True
+
+        # Rebuild columns
+        self._rebuild_model(profiles)
+        self._msg_store.clear()
+        self._poc_panel.clear()
+
+        # Store messages for possible re-run
+        self._last_messages = messages
 
         def _after_done():
             self._apply_filter(self._active_filter)
 
         t = AnalysisThread(
-            ext           = self,
-            messages      = messages,
-            token1        = t1,
-            token2        = t2,
-            tok_type      = tok_type,
-            tok_name      = tok_name,
-            ignore_pats   = self._get_ignore_pats(),
+            ext             = self,
+            messages        = messages,
+            profiles        = profiles,
+            cmp_mode        = cmp_mode,
+            ignore_pats     = self._get_ignore_pats(),
             smart_filter_on = self._sf_cb.isSelected(),
-            model         = self._model,
-            msg_store     = self._msg_store,
-            progress_bar  = self._pb,
-            log_fn        = self._log,
-            on_done_fn    = _after_done
+            model           = self._model,
+            msg_store       = self._msg_store,
+            progress_bar    = self._pb,
+            log_fn          = self._log,
+            on_done_fn      = _after_done,
         )
         self._pb.setValue(0)
-        self._pb.setString("Starting...")
+        self._pb.setString("Starting…")
         t.start()
+
+    def _run_from_stored(self):
+        """Re-run the last batch of requests with current user config."""
+        msgs = getattr(self, "_last_messages", None)
+        if not msgs:
+            JOptionPane.showMessageDialog(
+                self._root,
+                "No requests loaded yet.\n"
+                "Right-click a request in Burp and choose\n"
+                "\"Send to TokenTwin Checker\".",
+                "No Requests", JOptionPane.INFORMATION_MESSAGE)
+            return
+        self._enqueue(msgs)
 
     def _export_csv(self):
         chooser = JFileChooser()
@@ -1044,8 +1552,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         if not path.lower().endswith(".csv"):
             path += ".csv"
         try:
+            cols = [str(self._model.getColumnName(c))
+                    for c in range(self._model.getColumnCount())]
             w = FileWriter(path)
-            w.write(",".join(COLS) + "\n")
+            w.write(",".join(cols) + "\n")
             for r in range(self._model.getRowCount()):
                 vals = []
                 for c in range(self._model.getColumnCount()):
@@ -1064,5 +1574,4 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
                 "Error", JOptionPane.ERROR_MESSAGE)
 
 
-# need for RowFilter in _apply_filter
 import javax.swing
