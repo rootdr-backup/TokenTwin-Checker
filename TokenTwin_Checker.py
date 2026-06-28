@@ -1,7 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-TokenTwin Checker v4.0  -  Multi-User BAC / IDOR Tester
+TokenTwin Checker v4.1  -  Multi-User BAC / IDOR Tester
 Burp Suite Extension  |  Jython 2.7 compatible
+
+New in v4.1:
+  - Bug fix: _body_hash encoding crash on non-ASCII bodies (Jython 2.7 compat)
+  - Bug fix: cookie merge now uses OrderedDict — cookie order preserved
+  - Bug fix: _msg_store cleared when user profile set changes (no stale data)
+  - Bug fix: POC column headers now update when user labels change (not just count)
+  - New: Stop button to cancel a running analysis mid-flight
+  - New: Log area capped at 500 lines to prevent OOM on long sessions
+  - Cleanup: removed dead _orig_add/_orig_del no-op patch code
 
 New in v4:
   - Multi-User: Add/remove unlimited users, each with their own token
@@ -24,6 +33,7 @@ Install:
 
 # ── Burp API ──────────────────────────────────────────────────
 from burp import IBurpExtender, ITab, IContextMenuFactory, IMessageEditorController
+
 
 # ── Swing / AWT ───────────────────────────────────────────────
 from javax.swing import (
@@ -56,6 +66,7 @@ import difflib
 import jarray
 import json
 import os
+from collections import OrderedDict
 
 
 # ─────────────────────────────────────────────────────────────
@@ -464,10 +475,6 @@ class UserManagerPanel(JPanel):
         self._add_user(label="User A (Baseline)", is_baseline=True)
         self._add_user(label="User B")
 
-    # internal ref trick for inner classes in Jython
-    _add_user    = None
-    _remove_last = None
-
     def _add_user(self, label=None, headers=None, is_baseline=False):
         if len(self._user_panels) >= self.MAX_USERS:
             JOptionPane.showMessageDialog(
@@ -578,13 +585,6 @@ class UserManagerPanel(JPanel):
         return str(self._cmp_combo.getSelectedItem())
 
 
-# Fix Jython self reference in methods defined with `def` inside class body
-# We need to patch _add_user etc. after class is created:
-_orig_add  = UserManagerPanel._add_user
-_orig_del  = UserManagerPanel._remove_last
-UserManagerPanel._add_user    = _orig_add
-UserManagerPanel._remove_last = _orig_del
-
 
 # ─────────────────────────────────────────────────────────────
 #  Dynamic result table
@@ -687,6 +687,10 @@ class AnalysisThread(threading.Thread):
         self._log           = log_fn
         self._on_done       = on_done_fn
         self._counter       = [model.getRowCount() + 1]
+        self._stop_event    = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
 
     # ── response helpers ──────────────────────────────────────
     def _get_body_str(self, resp_bytes):
@@ -704,7 +708,11 @@ class AnalysisThread(threading.Thread):
                 s = re.sub(p, "", s)
             except Exception:
                 pass
-        return hashlib.md5(s.encode("utf-8", errors="replace")).hexdigest()
+        try:
+            raw = s.encode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            raw = s.encode("utf-8", "replace") if isinstance(s, unicode) else s
+        return hashlib.md5(raw).hexdigest()
 
     def _status(self, resp_bytes):
         if not resp_bytes:
@@ -740,8 +748,8 @@ class AnalysisThread(threading.Thread):
                 for h in headers:
                     if h.lower().startswith("cookie:"):
                         existing_pairs = [x.strip() for x in h[7:].strip().split(";")]
-                        # Build dict of existing cookies, then overlay new ones
-                        ck_dict = {}
+                        # Build ordered dict of existing cookies, then overlay new ones
+                        ck_dict = OrderedDict()
                         for part in existing_pairs:
                             if "=" in part:
                                 k, _, v = part.partition("=")
@@ -823,6 +831,9 @@ class AnalysisThread(threading.Thread):
             total, n_users, self._cmp_mode))
 
         for idx, msg in enumerate(self._msgs):
+            if self._stop_event.is_set():
+                self._log("[*] Stopped by user.")
+                break
             try:
                 svc       = msg.getHttpService()
                 req_bytes = msg.getRequest()
@@ -924,8 +935,8 @@ class AnalysisThread(threading.Thread):
                     v, "{}%  ({}/{})".format(v, i+1, total))
             )
 
-        summary = "Done — tested:{} skipped:{} total:{}".format(
-            tested, skip_c, total)
+        prefix  = "Stopped" if self._stop_event.is_set() else "Done"
+        summary = "{} — tested:{} skipped:{} total:{}".format(prefix, tested, skip_c, total)
         SwingUtilities.invokeLater(lambda: self._set_progress(0, summary))
         self._log("[*] " + summary)
         if self._on_done:
@@ -1043,9 +1054,10 @@ class PocPanel(JPanel):
         user_data_list: list of dicts {"label", "req", "resp"}
         """
         labels = [u["label"] for u in user_data_list]
-        # Rebuild columns if user count changed
-        if len(user_data_list) != len(self._editors):
+        cur_labels = getattr(self, "_current_labels", None)
+        if labels != cur_labels:
             self._build_columns(labels)
+            self._current_labels = labels
 
         empty = jarray.array([], "b")
         for i, ud in enumerate(user_data_list):
@@ -1075,7 +1087,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         callbacks.setExtensionName("TokenTwin Checker")
 
         self._stdout    = PrintWriter(callbacks.getStdout(), True)
-        self._log("TokenTwin Checker v4.0 loaded  (Multi-User + Header Manager)")
+        self._log("TokenTwin Checker v4.1 loaded  (Multi-User + Header Manager)")
 
         self._msg_store = {}
         self._ui_ready  = threading.Event()
@@ -1110,13 +1122,20 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         return out
 
     # ── Logging ───────────────────────────────────────────────
+    _MAX_LOG_LINES = 500
+
     def _log(self, msg):
         self._stdout.println(msg)
         if hasattr(self, "_log_area"):
             def _do():
                 self._log_area.append(msg + "\n")
                 doc = self._log_area.getDocument()
-                self._log_area.setCaretPosition(doc.getLength())
+                text = self._log_area.getText()
+                lines = text.split("\n")
+                if len(lines) > self._MAX_LOG_LINES:
+                    trimmed = "\n".join(lines[-self._MAX_LOG_LINES:])
+                    self._log_area.setText(trimmed)
+                self._log_area.setCaretPosition(self._log_area.getDocument().getLength())
             SwingUtilities.invokeLater(_do)
 
     # ─────────────────────────────────────────────────────────
@@ -1146,7 +1165,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
         p.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, P.BORDER))
         p.add(lbl("TokenTwin Checker", bold=True, size=18, color=P.ACCENT))
         p.add(lbl("|", color=P.BORDER))
-        p.add(lbl("v4.0  |  Multi-User BAC / IDOR Hunter", size=12, color=P.DIM))
+        p.add(lbl("v4.1  |  Multi-User BAC / IDOR Hunter", size=12, color=P.DIM))
         return p
 
     # ── Config panel ──────────────────────────────────────────
@@ -1207,11 +1226,20 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
         # Buttons
         b_run  = mk_btn("▶ Run Test",   P.ACCENT)
+        b_stop = mk_btn("■ Stop",       P.BTN_DEL)
         b_clr  = mk_btn("Clear All",    P.BTN_CLR)
         b_exp  = mk_btn("Export CSV",   P.BTN_EXP)
 
         class _Run(ActionListener):
             def actionPerformed(_s, e): self._run_from_stored()
+        class _Stop(ActionListener):
+            def actionPerformed(_s, e):
+                t = getattr(self, "_active_thread", None)
+                if t is not None and t.is_alive():
+                    t.stop()
+                    self._log("[*] Stop requested…")
+                else:
+                    self._log("[*] No active test to stop.")
         class _Clr(ActionListener):
             def actionPerformed(_s, e):
                 self._model.setRowCount(0)
@@ -1223,14 +1251,16 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
             def actionPerformed(_s, e): self._export_csv()
 
         b_run.addActionListener(_Run())
+        b_stop.addActionListener(_Stop())
         b_clr.addActionListener(_Clr())
         b_exp.addActionListener(_Exp())
         b_run.setToolTipText("Re-run test on last received requests with current user config")
+        b_stop.setToolTipText("Stop the currently running analysis")
 
         g.gridx, g.gridy, g.gridwidth = 0, 3, 4
         btn_row = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
         btn_row.setBackground(P.BG_PANEL)
-        for b in [b_run, b_clr, b_exp]:
+        for b in [b_run, b_stop, b_clr, b_exp]:
             btn_row.add(b)
         opt.add(btn_row, g)
 
@@ -1456,6 +1486,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory):
 
         self._model = new_model
         self._table.setModel(new_model)
+        self._msg_store.clear()
 
         # Re-apply renderer
         rr = ResultRenderer(lambda: self._model.col_result())
